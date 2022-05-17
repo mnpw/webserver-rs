@@ -1,99 +1,146 @@
-use std::{
-    sync::{mpsc, Arc, Mutex},
-    thread,
-};
+use bytes::BytesMut;
+use futures::lock::Mutex;
+use hyper::Body;
+use hyper::Request;
+use hyper::Response;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use tokio::io::ReadHalf;
 
-pub struct ThreadPool {
-    workers: Vec<Worker>,
-    sender: mpsc::Sender<Message>,
+use std::future::Future;
+use std::pin::Pin;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+pub enum MethodType {
+    DELETE,
+    GET,
+    PATCH,
+    POST,
+    PUT,
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-enum Message {
-    NewJob(Job),
-    Terminate,
+pub struct Server {
+    addr: SocketAddr,
+    router: Arc<Mutex<Router>>,
 }
 
-impl ThreadPool {
-    /// Create a new ThreadPool.
-    ///
-    /// The size is the number of threads in the pool.
-    ///
-    /// # Panics
-    ///
-    /// The `new` function will panic if the size is zero.
-    pub fn new(size: usize) -> ThreadPool {
-        assert!(size > 0);
+type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-        let mut workers = Vec::with_capacity(size);
-
-        let (sender, receiver) = mpsc::channel();
-        let receiver = Arc::new(Mutex::new(receiver));
-
-        for id in 0..size {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
-        }
-
-        println!("Workers made successfully!");
-
-        ThreadPool { workers, sender }
-    }
-
-    pub fn execute<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let job = Box::new(f);
-        self.sender.send(Message::NewJob(job)).unwrap();
-    }
-}
-
-impl Drop for ThreadPool {
-    fn drop(&mut self) {
-        println!("Sending terminate signal to all workers.");
-
-        for _ in &self.workers {
-            self.sender.send(Message::Terminate).unwrap();
-        }
-
-        println!("Shutting down all workers.");
-
-        for worker in &mut self.workers {
-            println!("Shutting down worker: {}", worker.id);
-
-            if let Some(thread) = worker.thread.take() {
-                thread.join().unwrap();
-            };
+impl Server {
+    pub fn new(addr: SocketAddr, router: Router) -> Server {
+        Server {
+            addr,
+            router: Arc::new(Mutex::new(router)),
         }
     }
-}
 
-pub struct Worker {
-    id: usize,
-    thread: Option<thread::JoinHandle<()>>,
-}
+    pub async fn serve(&mut self) -> Result<()> {
+        let listener = TcpListener::bind(self.addr).await?;
 
-impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
-        let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap();
+        loop {
+            let (socket, _) = listener.accept().await?;
+            let router = self.router.clone();
 
-            match job {
-                Message::NewJob(job) => {
-                    println!("Worker {} got a job, executing.", id);
-                    job();
-                }
-                Message::Terminate => {
-                    println!("Worker {} was told to terminate.", id);
-                    break;
-                }
-            }
+            tokio::spawn(async move {
+                Self::process(socket, router).await?;
+                Ok::<_, Error>(())
+            });
+        }
+    }
+
+    async fn process(stream: TcpStream, router: Arc<Mutex<Router>>) -> Result<()> {
+        let (rd, mut wr) = io::split(stream);
+        let mut router = router.lock().await;
+
+        let request = Self::parse_request(rd).await?;
+        let path = request.uri().to_string();
+
+        let mut response = router.route_match(&path)(request).await?;
+
+        tokio::spawn(async move {
+            let byte_response = hyper::body::to_bytes(response.body_mut()).await.unwrap();
+            wr.write_all(&byte_response[..]).await?;
+
+            Ok::<_, io::Error>(())
         });
 
-        Worker {
-            id,
-            thread: Some(thread),
+        Ok(())
+    }
+
+    async fn parse_request(stream: ReadHalf<TcpStream>) -> Result<Request<Body>> {
+        let mut buffer = BytesMut::with_capacity(4 * 1024);
+        BufReader::new(stream).read_buf(&mut buffer).await?;
+
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut buf_request = httparse::Request::new(&mut headers);
+        buf_request.parse(&buffer)?;
+
+        let mut request = Request::builder()
+            .method(buf_request.method.unwrap())
+            .uri(buf_request.path.unwrap())
+            .version(hyper::Version::HTTP_11);
+
+        for header in buf_request.headers {
+            request = request.header(header.name, header.value);
         }
+
+        Ok(request.body(Body::empty()).unwrap())
+    }
+}
+
+type Service = Box<
+    dyn Fn(
+            Request<Body>,
+        ) -> Pin<
+            Box<dyn Future<Output = std::result::Result<Response<Body>, Infallible>> + Send + Sync>,
+        > + Send
+        + Sync,
+>;
+
+pub struct Router {
+    count: usize,
+    inner: HashMap<String, Service>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Router::new()
+    }
+}
+
+impl Router {
+    pub fn new() -> Self {
+        let map: HashMap<String, Service> = HashMap::new();
+        Router {
+            count: 0,
+            inner: map,
+        }
+    }
+
+    pub fn route<F>(
+        &mut self,
+        path: &str,
+        service: impl Fn(Request<Body>) -> F + Send + Sync + 'static,
+    ) where
+        F: Future<Output = std::result::Result<Response<Body>, Infallible>> + Sync + Send + 'static,
+    {
+        self.inner.insert(
+            path.to_string(),
+            Box::new(move |req| Box::pin(service(req))),
+        );
+        self.count += 1;
+    }
+
+    pub fn route_match(&mut self, path: &str) -> &mut Service {
+        let valid_path = self.inner.get_mut(path).is_some();
+
+        if !valid_path {
+            return self.inner.get_mut("*").unwrap();
+        }
+
+        self.inner.get_mut(path).unwrap()
     }
 }
