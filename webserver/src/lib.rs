@@ -13,6 +13,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+pub use webserver_macro::endpoint;
+
 pub enum MethodType {
     DELETE,
     GET,

@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use hyper::*;
-use webserver::{Result, Router, Server};
+use webserver::{endpoint, Result, Router, Server};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -17,18 +17,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// #[endpoint {
-//     method = GET,
-//     path = "/*",
-// }]
+#[endpoint {
+    method = GET,
+    path = "/*",
+}]
 async fn echo(req: Request<Body>) -> std::result::Result<Response<Body>, Infallible> {
     Ok(Response::new(req.uri().to_string().into()))
 }
 
-// #[endpoint {
-//     method = GET,
-//     path = "/welcome",
-// }]
+#[endpoint {
+    method = GET,
+    path = "/welcome",
+}]
 async fn welcome(_req: Request<Body>) -> std::result::Result<Response<Body>, Infallible> {
     Ok(Response::new("Welcome to the hacky server".into()))
 }
