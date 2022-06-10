@@ -59,3 +59,39 @@ In a nutshell, async APIs are there to minimize the CPU idle time caused by IO. 
 You don't want your cpu to be idle. So you want it to pick up some other task. That is why you want a concurrency model to be there.
 
 ---
+
+
+anti-features:
+- not a framework 
+
+
+Server(listener, router)
+Router(inner)
+
+
+server.run/serve -> returns a future basically 
+server has 1 associated `listener` and many `handlers` spun up
+
+- start the server layer
+- server layer should be bothered purely with how to mange the server
+    - managing state like connected dbs
+    - connection cap
+    - routing
+    - graceful shutdown
+    - connecting to other services(?)
+- put listener inside the server layer
+- start tcp listener at a port
+- clients connect to the port 
+- every client that has connected results in a socket
+- for every connection we spawn a tokio task and return to cater to new connections
+- we pass every connection (tcpstream) to a handler function
+- this handler function creates a connection object for every connection
+    - inspired by how mini-redis is doing things
+- 
+
+
+
+user writes 
+async fn() -> () {
+
+}
